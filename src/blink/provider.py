@@ -4,6 +4,7 @@ import json
 from aiohttp import ClientSession
 from blinkpy.blinkpy import Blink
 from blinkpy.auth import Auth
+from blinkpy.helpers.util import BlinkException
 
 import scrypted_sdk
 from scrypted_sdk import (
@@ -99,23 +100,46 @@ class BlinkProvider(ScryptedDeviceBase, DeviceProvider, Settings):
                 raise Exception("Blink username and password must be set before initializing.")
 
             blink = Blink(session=ClientSession())
-            if self.auth_data:
-                auth = Auth(self.auth_data)
-                waiting_for_2fa = False
-            else:
-                auth = Auth({"username": self.username, "password": self.password}, no_prompt=True)
-                waiting_for_2fa = True
-            blink.auth = auth
+            blink.auth = Auth({"username": self.username, "password": self.password}, no_prompt=True)
 
-            started = await blink.start()
-            if not started:
-                raise Exception("Failed to start Blink client. Check your username and password.")
-
-            self.auth_data = blink.auth.login_attributes
+            # Store blink instance for 2FA handling
             self.blink = blink
 
-            if not waiting_for_2fa:
+            # Try to start with saved auth data if available
+            if self.auth_data:
+                blink.auth.login_attributes = self.auth_data
+
+            try:
+                started = await blink.start()
+                if not started:
+                    raise Exception("Failed to start Blink client. Check your username and password.")
+
+                # Save the auth data after successful login
+                self.auth_data = blink.auth.login_attributes
+
+                # If we got here, either 2FA wasn't needed or we had valid saved credentials
                 await self.finish_init("")
+
+            except BlinkException as be:
+                # Check if this is a 2FA required error
+                error_msg = str(be)
+                if "2FA" in error_msg or "key" in error_msg.lower() or "pin" in error_msg.lower():
+                    self.print("2FA required. Please enter the code sent to your email in the plugin settings.")
+                    # Keep blink instance for 2FA completion
+                else:
+                    # Other authentication errors
+                    self.print(f"Authentication error: {be}")
+                    self.blink = None
+                    self.auth_data = None
+                    raise Exception(f"Failed to authenticate with Blink: {be}")
+
+        except BlinkException as e:
+            self.print(f"Error initializing Blink: {e}")
+            # Don't clear blink/auth_data if it's a 2FA request
+            if "2FA" not in str(e) and "key" not in str(e).lower():
+                self.blink = None
+                self.auth_data = None
+            raise
         except Exception as e:
             self.print(f"Error initializing Blink: {e}")
             self.blink = None
@@ -123,34 +147,45 @@ class BlinkProvider(ScryptedDeviceBase, DeviceProvider, Settings):
             raise
 
     async def finish_init(self, mfa_code: str) -> None:
-        if mfa_code:
-            await self.blink.auth.send_auth_key(self.blink, mfa_code)
-            await self.blink.setup_post_verify()
+        try:
+            if mfa_code:
+                # Send the 2FA code
+                await self.blink.auth.send_auth_key(self.blink, mfa_code)
+                # Complete the setup after verification
+                await self.blink.setup_post_verify()
+                # Save the auth data after successful 2FA
+                self.auth_data = self.blink.auth.login_attributes
+                self.print("2FA verification successful!")
 
-        devices = []
-        for key, camera in self.blink.cameras.items():
-            manifest: Device = {
-                "name": camera.name,
-                "nativeId": camera.camera_id,
-                "info": {
-                    "manufacturer": "Blink",
-                    "model": camera.product_type,
-                    "firmware": camera.version,
-                    "serialNumber": camera.serial,
-                },
-                "type": ScryptedDeviceType.Camera.value,
-                "interfaces": [
-                    ScryptedInterface.Camera.value,
-                    ScryptedInterface.VideoCamera.value,
-                    #ScryptedInterface.MotionSensor.value,
-                ],
-            }
-            devices.append(manifest)
-            self.devices[camera.camera_id] = key  # Placeholder for BlinkCamera instance
+            # Discover and register cameras
+            devices = []
+            for key, camera in self.blink.cameras.items():
+                manifest: Device = {
+                    "name": camera.name,
+                    "nativeId": camera.camera_id,
+                    "info": {
+                        "manufacturer": "Blink",
+                        "model": camera.product_type,
+                        "firmware": camera.version,
+                        "serialNumber": camera.serial,
+                    },
+                    "type": ScryptedDeviceType.Camera.value,
+                    "interfaces": [
+                        ScryptedInterface.Camera.value,
+                        ScryptedInterface.VideoCamera.value,
+                        #ScryptedInterface.MotionSensor.value,
+                    ],
+                }
+                devices.append(manifest)
+                self.devices[camera.camera_id] = key  # Placeholder for BlinkCamera instance
 
-        await scrypted_sdk.deviceManager.onDevicesChanged({
-            "devices": devices
-        })
+            await scrypted_sdk.deviceManager.onDevicesChanged({
+                "devices": devices
+            })
+
+        except Exception as e:
+            self.print(f"Error completing 2FA verification: {e}")
+            raise
 
     async def getDevice(self, nativeId: str) -> ScryptedDeviceBase:
         if nativeId not in self.devices:
