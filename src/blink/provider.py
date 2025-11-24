@@ -3,8 +3,7 @@ import json
 
 from aiohttp import ClientSession
 from blinkpy.blinkpy import Blink
-from blinkpy.auth import Auth
-from blinkpy.helpers.util import BlinkException
+from blinkpy.auth import Auth, BlinkTwoFARequiredError
 
 import scrypted_sdk
 from scrypted_sdk import (
@@ -18,13 +17,6 @@ from scrypted_sdk import (
 )
 
 from .camera import BlinkCamera
-
-# Import 2FA specific exception if available
-try:
-    from blinkpy.helpers.util import BlinkTwoFARequiredError
-except ImportError:
-    # Fallback if the exception doesn't exist in this version
-    BlinkTwoFARequiredError = BlinkException
 
 
 class BlinkProvider(ScryptedDeviceBase, DeviceProvider, Settings):
