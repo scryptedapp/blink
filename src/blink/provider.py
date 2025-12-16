@@ -141,11 +141,8 @@ class BlinkProvider(ScryptedDeviceBase, DeviceProvider, Settings):
             # Attempt to start Blink
             started = await blink.start()
             if not started:
-                # Check if 2FA is required - blink.start() returns False when 2FA is needed
-                # The library prints "Two-factor authentication required. Waiting for otp."
-                self.print("2FA required. Please enter the code sent to your email in the '2FA Code' field and click Save.")
-                self.waiting_for_2fa = True
-                # Don't cleanup - we need the session for 2FA submission
+                self.print("Invalid username or password.")
+                await self.cleanup()
                 return
 
             # Success! Save auth data and discover cameras
@@ -156,22 +153,15 @@ class BlinkProvider(ScryptedDeviceBase, DeviceProvider, Settings):
 
         except BlinkTwoFARequiredError:
             # 2FA is required (explicit exception)
-            self.print("2FA required. Please enter the code sent to your email in the '2FA Code' field and click Save.")
+            self.print("2FA required. Please enter the code sent to your email or SMS in the '2FA Code' field and click Save.")
             self.waiting_for_2fa = True
             # Don't raise - we're waiting for user input
 
         except Exception as e:
-            # Check if this is a 2FA related error (for older versions that don't have specific exception)
-            error_msg = str(e)
-            if "2FA" in error_msg or "412" in error_msg or "key" in error_msg.lower() or "pin" in error_msg.lower() or "otp" in error_msg.lower():
-                self.print("2FA required. Please enter the code sent to your email in the '2FA Code' field and click Save.")
-                self.waiting_for_2fa = True
-                # Don't raise - we're waiting for user input
-            else:
-                # Other authentication errors
-                self.print(f"Authentication error: {e}")
-                await self.cleanup()
-                # Don't re-raise to avoid breaking the plugin initialization
+            # Other authentication errors
+            self.print(f"Authentication error: {e}")
+            await self.cleanup()
+            # Don't re-raise to avoid breaking the plugin initialization
 
     async def finish_init(self, mfa_code: str) -> None:
         """Complete authentication with 2FA code."""
@@ -187,14 +177,10 @@ class BlinkProvider(ScryptedDeviceBase, DeviceProvider, Settings):
             self.print(f"Submitting 2FA code...")
 
             # Set the 2FA code in auth data
-            self.blink.auth.data["2fa_code"] = mfa_code
-
-            # Call start() again - this will complete the authentication with the 2FA code
-            started = await self.blink.start()
+            started = await self.blink.send_2fa_code(mfa_code)
             if not started:
-                self.print("2FA code may be incorrect or expired. Please try again.")
-                # Reset waiting_for_2fa so user can try again
-                self.waiting_for_2fa = False
+                self.print("Invalid 2FA code.")
+                await self.cleanup()
                 return
 
             # Success! Save auth data and discover cameras
