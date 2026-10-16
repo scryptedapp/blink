@@ -24,6 +24,7 @@ class BlinkCamera(ScryptedDeviceBase, Camera, VideoCamera):
 
     last_image: bytes = None
     last_image_timestamp: datetime = None
+    snapshot_task: asyncio.Task = None
 
     def __init__(self, nativeId: str, blink: Blink, camera: BlinkPyCamera) -> None:
         super().__init__(nativeId=nativeId)
@@ -34,16 +35,38 @@ class BlinkCamera(ScryptedDeviceBase, Camera, VideoCamera):
         return []
 
     async def takePicture(self, options: RequestPictureOptions = None) -> MediaObject:
-        if self.last_image and self.last_image_timestamp:
-            # If the last image is recent, return it instead of taking a new picture.
-            if (datetime.now() - self.last_image_timestamp).total_seconds() < 60:
-                return await scrypted_sdk.mediaManager.createMediaObject(self.last_image, mimeType='image/jpeg')
-        await self.camera.snap_picture()
-        response = await self.camera.get_media()
-        picture = await response.read()
-        self.last_image = picture
-        self.last_image_timestamp = datetime.now()
-        return await scrypted_sdk.mediaManager.createMediaObject(picture, mimeType='image/jpeg')
+        # blinkpy only updates camera.thumbnail on blink.refresh(), so after snap_picture()
+        # we refresh until the new thumbnail appears. Blink's cloud takes several seconds,
+        # so serve the last image while a new one is fetched in the background, and only
+        # block when there is no image yet.
+        age = (datetime.now() - self.last_image_timestamp).total_seconds() if self.last_image_timestamp else None
+        if self.last_image and age < 60:
+            return await scrypted_sdk.mediaManager.createMediaObject(self.last_image, mimeType='image/jpeg')
+        if not self.snapshot_task or self.snapshot_task.done():
+            self.snapshot_task = asyncio.create_task(self.fetch_picture())
+        if not self.last_image:
+            await asyncio.shield(self.snapshot_task)
+        if not self.last_image:
+            raise Exception("Blink snapshot unavailable")
+        return await scrypted_sdk.mediaManager.createMediaObject(self.last_image, mimeType='image/jpeg')
+
+    async def fetch_picture(self) -> None:
+        try:
+            old_thumbnail = self.camera.thumbnail
+            await self.camera.snap_picture()
+            for _ in range(6):
+                await asyncio.sleep(3)
+                await self.blink.refresh(force=True)
+                if self.camera.thumbnail and self.camera.thumbnail != old_thumbnail:
+                    break
+            response = await self.camera.get_media()
+            if not response or response.status != 200:
+                self.print(f"Snapshot failed: thumbnail={self.camera.thumbnail} status={response and response.status}")
+                return
+            self.last_image = await response.read()
+            self.last_image_timestamp = datetime.now()
+        except Exception as e:
+            self.print(f"Snapshot failed: {e!r}")
 
     async def getVideoStreamOptions(self) -> list[ResponseMediaStreamOptions]:
         return [
